@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Comment Analytics - Mock Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e8e8e8; padding: 20px; max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 1.4em; margin-bottom: 16px; color: #fff; }
+    .note { font-size: 0.8em; color: #888; margin-bottom: 20px; }
+
+    /* Input */
+    .input-group { display: flex; gap: 8px; margin-bottom: 20px; }
+    input[type="text"] { flex: 1; padding: 10px 14px; border: 1px solid #333; border-radius: 8px; background: #1a1a1a; color: #fff; font-size: 14px; outline: none; }
+    input[type="text"]:focus { border-color: #3ea6ff; }
+    button { padding: 10px 20px; border: none; border-radius: 8px; background: #3ea6ff; color: #000; font-weight: 600; cursor: pointer; font-size: 14px; white-space: nowrap; }
+    button:hover { background: #65b8ff; }
+    button:disabled { background: #333; color: #666; cursor: not-allowed; }
+    .btn-group { display: flex; gap: 8px; }
+
+    /* Tabs */
+    .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #333; }
+    .tab { padding: 8px 16px; background: none; border: none; color: #888; cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
+    .tab.active { color: #fff; border-bottom-color: #3ea6ff; }
+
+    /* Cards */
+    .card { background: #1a1a1a; border: 1px solid #282828; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+    .card h2 { font-size: 1.1em; margin-bottom: 8px; }
+    .card h3 { font-size: 0.95em; margin-bottom: 6px; color: #aaa; }
+    .stat { display: inline-block; margin-right: 16px; font-size: 0.85em; color: #aaa; }
+    .stat b { color: #fff; }
+
+    /* Channel */
+    .channel-header { display: flex; align-items: center; gap: 16px; }
+    .channel-header img { width: 72px; height: 72px; border-radius: 50%; }
+    .channel-info { flex: 1; }
+
+    /* Video list */
+    .video-item { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid #222; cursor: pointer; }
+    .video-item:hover { background: #222; border-radius: 8px; padding: 10px; margin: 0 -10px; }
+    .video-item:last-child { border-bottom: none; }
+    .video-thumb { width: 160px; height: 90px; object-fit: cover; border-radius: 8px; flex-shrink: 0; }
+    .video-meta { flex: 1; }
+    .video-meta h4 { font-size: 0.9em; margin-bottom: 4px; }
+    .video-meta .stat { font-size: 0.8em; }
+
+    /* Comments */
+    .comment { padding: 10px 0; border-bottom: 1px solid #222; }
+    .comment:last-child { border-bottom: none; }
+    .comment-author { font-size: 0.85em; font-weight: 600; color: #3ea6ff; margin-bottom: 2px; }
+    .comment-text { font-size: 0.9em; line-height: 1.5; margin-bottom: 4px; white-space: pre-wrap; word-break: break-word; }
+    .comment-meta { font-size: 0.75em; color: #666; }
+    .reply { margin-left: 32px; padding-left: 12px; border-left: 2px solid #333; }
+
+    /* Loading / Error */
+    .loading { text-align: center; padding: 40px; color: #888; }
+    .error { background: #3a1a1a; border-color: #662222; color: #ff6b6b; }
+    .hidden { display: none; }
+
+    /* Quota */
+    .quota-bar { position: fixed; bottom: 0; left: 0; right: 0; background: #1a1a1a; border-top: 1px solid #333; padding: 6px 20px; font-size: 0.75em; color: #888; display: flex; justify-content: space-between; }
+  </style>
+</head>
+<body>
+  <h1>YouTube Comment Analytics - Mock Viewer</h1>
+  <p class="note">APIレスポンスの確認用モック。動画URLまたはチャンネルIDを入力してください。</p>
+
+  <div class="input-group">
+    <input type="text" id="input" placeholder="動画URL, チャンネルURL, or ID (例: https://www.youtube.com/watch?v=dQw4w9WgXcQ)">
+    <div class="btn-group">
+      <button onclick="detect()">検索</button>
+    </div>
+  </div>
+
+  <div class="tabs hidden" id="tabs">
+    <button class="tab active" data-tab="channel" onclick="switchTab('channel')">チャンネル</button>
+    <button class="tab" data-tab="videos" onclick="switchTab('videos')">動画一覧</button>
+    <button class="tab" data-tab="comments" onclick="switchTab('comments')">コメント</button>
+  </div>
+
+  <div id="content"></div>
+
+  <div class="quota-bar">
+    <span>API Quota Used: <b id="quotaCount">0</b> units</span>
+    <span>Daily Limit: 10,000 units</span>
+  </div>
+
+  <script>
+    const API_KEY_PROMPT = 'YouTube API Key を入力してください';
+    let API_KEY = localStorage.getItem('yt_api_key') || '';
+    let quotaUsed = 0;
+    let currentChannel = null;
+    let currentVideos = [];
+    let currentVideoId = null;
+
+    function getApiKey() {
+      if (!API_KEY) {
+        API_KEY = prompt(API_KEY_PROMPT);
+        if (API_KEY) localStorage.setItem('yt_api_key', API_KEY);
+      }
+      return API_KEY;
+    }
+
+    function resetApiKey() {
+      API_KEY = '';
+      localStorage.removeItem('yt_api_key');
+      alert('API Key をリセットしました。次回検索時に再入力してください。');
+    }
+
+    async function ytApi(endpoint, params) {
+      const key = getApiKey();
+      if (!key) throw new Error('API Key が未設定です');
+      params.key = key;
+      const qs = new URLSearchParams(params).toString();
+      const url = `https://www.googleapis.com/youtube/v3/${endpoint}?${qs}`;
+      const resp = await fetch(url);
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error.message);
+      // Quota tracking (approximate)
+      const cost = endpoint === 'search' ? 100 : 1;
+      quotaUsed += cost;
+      document.getElementById('quotaCount').textContent = quotaUsed;
+      return data;
+    }
+
+    // ---------- Detect input type ----------
+
+    function detect() {
+      const raw = document.getElementById('input').value.trim();
+      if (!raw) return;
+
+      // Video URL
+      const videoMatch = raw.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]{11})/);
+      if (videoMatch) {
+        fetchVideoAndComments(videoMatch[1]);
+        return;
+      }
+
+      // Channel URL with /channel/UCxxx
+      const chIdMatch = raw.match(/youtube\.com\/channel\/(UC[\w-]+)/);
+      if (chIdMatch) {
+        fetchChannel(chIdMatch[1]);
+        return;
+      }
+
+      // Channel URL with @handle
+      const handleMatch = raw.match(/youtube\.com\/@([\w.-]+)/);
+      if (handleMatch) {
+        fetchChannelByHandle(handleMatch[1]);
+        return;
+      }
+
+      // Raw channel ID
+      if (raw.startsWith('UC') && raw.length >= 20) {
+        fetchChannel(raw);
+        return;
+      }
+
+      // Raw video ID (11 chars)
+      if (/^[\w-]{11}$/.test(raw)) {
+        fetchVideoAndComments(raw);
+        return;
+      }
+
+      // @handle
+      if (raw.startsWith('@')) {
+        fetchChannelByHandle(raw.substring(1));
+        return;
+      }
+
+      showError('入力形式を認識できません。動画URL, チャンネルURL, ID, @handle のいずれかを入力してください。');
+    }
+
+    // Allow Enter key
+    document.getElementById('input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') detect();
+    });
+
+    // ---------- Fetch functions ----------
+
+    async function fetchChannel(channelId) {
+      showLoading('チャンネル情報を取得中...');
+      try {
+        const data = await ytApi('channels', {
+          part: 'snippet,statistics,contentDetails',
+          id: channelId
+        });
+        if (!data.items || data.items.length === 0) {
+          showError('チャンネルが見つかりません');
+          return;
+        }
+        currentChannel = data.items[0];
+        showTabs();
+        renderChannel();
+        // Also fetch videos
+        const uploadsId = currentChannel.contentDetails?.relatedPlaylists?.uploads;
+        if (uploadsId) fetchVideos(uploadsId);
+      } catch (e) { showError(e.message); }
+    }
+
+    async function fetchChannelByHandle(handle) {
+      showLoading(`@${handle} のチャンネルを検索中...`);
+      try {
+        const data = await ytApi('channels', {
+          part: 'snippet,statistics,contentDetails',
+          forHandle: handle
+        });
+        if (!data.items || data.items.length === 0) {
+          showError('チャンネルが見つかりません');
+          return;
+        }
+        currentChannel = data.items[0];
+        showTabs();
+        renderChannel();
+        const uploadsId = currentChannel.contentDetails?.relatedPlaylists?.uploads;
+        if (uploadsId) fetchVideos(uploadsId);
+      } catch (e) { showError(e.message); }
+    }
+
+    async function fetchVideos(playlistId) {
+      try {
+        const plData = await ytApi('playlistItems', {
+          part: 'snippet,contentDetails',
+          playlistId: playlistId,
+          maxResults: 10
+        });
+        if (!plData.items) return;
+
+        const videoIds = plData.items.map(i => i.contentDetails.videoId).join(',');
+        const vidData = await ytApi('videos', {
+          part: 'snippet,statistics,contentDetails',
+          id: videoIds
+        });
+        currentVideos = vidData.items || [];
+      } catch (e) { console.error('fetchVideos:', e); }
+    }
+
+    async function fetchVideoAndComments(videoId) {
+      showLoading('動画情報を取得中...');
+      try {
+        const vidData = await ytApi('videos', {
+          part: 'snippet,statistics,contentDetails',
+          id: videoId
+        });
+        if (!vidData.items || vidData.items.length === 0) {
+          showError('動画が見つかりません');
+          return;
+        }
+        currentVideoId = videoId;
+        const video = vidData.items[0];
+
+        // Also fetch channel
+        fetchChannel(video.snippet.channelId);
+
+        showTabs();
+        switchTab('comments');
+        renderVideoDetail(video);
+
+        // Fetch comments
+        const ctData = await ytApi('commentThreads', {
+          part: 'snippet,replies',
+          videoId: videoId,
+          maxResults: 20,
+          order: 'relevance'
+        });
+        renderComments(video, ctData.items || []);
+      } catch (e) { showError(e.message); }
+    }
+
+    // ---------- Render functions ----------
+
+    function renderChannel() {
+      if (!currentChannel) return;
+      const s = currentChannel.snippet;
+      const st = currentChannel.statistics;
+      const content = document.getElementById('content');
+      content.innerHTML = `
+        <div class="card">
+          <div class="channel-header">
+            <img src="${s.thumbnails?.high?.url || s.thumbnails?.default?.url}" alt="">
+            <div class="channel-info">
+              <h2>${esc(s.title)}</h2>
+              <div style="color:#aaa; font-size:0.85em; margin:4px 0">${esc(s.customUrl || '')} ${s.country ? '・' + s.country : ''}</div>
+              <div>
+                <span class="stat">登録者 <b>${fmtNum(st.subscriberCount)}</b></span>
+                <span class="stat">動画数 <b>${fmtNum(st.videoCount)}</b></span>
+                <span class="stat">総再生数 <b>${fmtNum(st.viewCount)}</b></span>
+              </div>
+            </div>
+          </div>
+          <p style="margin-top:12px; font-size:0.85em; color:#aaa; white-space:pre-wrap; max-height:120px; overflow:auto">${esc(s.description || '').slice(0, 300)}</p>
+        </div>
+        <div class="card">
+          <h3>Raw Data (channels.list)</h3>
+          <details><summary style="cursor:pointer; color:#3ea6ff; font-size:0.8em">JSON を表示</summary>
+            <pre style="font-size:0.75em; overflow:auto; max-height:400px; margin-top:8px; color:#aaa">${esc(JSON.stringify(currentChannel, null, 2))}</pre>
+          </details>
+        </div>
+      `;
+    }
+
+    function renderVideos() {
+      const content = document.getElementById('content');
+      if (currentVideos.length === 0) {
+        content.innerHTML = '<div class="card"><p style="color:#888">動画が読み込まれていません。先にチャンネルを検索してください。</p></div>';
+        return;
+      }
+      let html = '';
+      for (const v of currentVideos) {
+        const s = v.snippet;
+        const st = v.statistics;
+        html += `
+          <div class="video-item" onclick="fetchVideoAndComments('${v.id}')">
+            <img class="video-thumb" src="${s.thumbnails?.medium?.url || s.thumbnails?.default?.url}" alt="">
+            <div class="video-meta">
+              <h4>${esc(s.title)}</h4>
+              <div>
+                <span class="stat">再生 <b>${fmtNum(st.viewCount)}</b></span>
+                <span class="stat">高評価 <b>${fmtNum(st.likeCount)}</b></span>
+                <span class="stat">コメント <b>${fmtNum(st.commentCount)}</b></span>
+                <span class="stat">時間 <b>${v.contentDetails?.duration || '-'}</b></span>
+              </div>
+              <div class="stat" style="margin-top:4px">${s.publishedAt?.split('T')[0] || ''}</div>
+            </div>
+          </div>
+        `;
+      }
+      content.innerHTML = `<div class="card">${html}</div>`;
+    }
+
+    function renderVideoDetail(video) {
+      const s = video.snippet;
+      const st = video.statistics;
+      const content = document.getElementById('content');
+      content.innerHTML = `
+        <div class="card">
+          <h2>${esc(s.title)}</h2>
+          <div style="margin:8px 0">
+            <span class="stat">再生 <b>${fmtNum(st.viewCount)}</b></span>
+            <span class="stat">高評価 <b>${fmtNum(st.likeCount)}</b></span>
+            <span class="stat">コメント <b>${fmtNum(st.commentCount)}</b></span>
+            <span class="stat">${s.publishedAt?.split('T')[0] || ''}</span>
+          </div>
+        </div>
+        <div class="loading">コメントを読み込み中...</div>
+      `;
+    }
+
+    function renderComments(video, threads) {
+      const content = document.getElementById('content');
+      const s = video.snippet;
+      const st = video.statistics;
+
+      let html = `
+        <div class="card">
+          <h2>${esc(s.title)}</h2>
+          <div style="margin:8px 0">
+            <span class="stat">再生 <b>${fmtNum(st.viewCount)}</b></span>
+            <span class="stat">高評価 <b>${fmtNum(st.likeCount)}</b></span>
+            <span class="stat">コメント <b>${fmtNum(st.commentCount)}</b></span>
+          </div>
+          <details><summary style="cursor:pointer; color:#3ea6ff; font-size:0.8em">Video JSON</summary>
+            <pre style="font-size:0.75em; overflow:auto; max-height:300px; margin-top:8px; color:#aaa">${esc(JSON.stringify(video, null, 2))}</pre>
+          </details>
+        </div>
+      `;
+
+      html += '<div class="card"><h3>コメント (' + threads.length + '件表示)</h3>';
+      for (const t of threads) {
+        const tlc = t.snippet.topLevelComment.snippet;
+        const replyCount = t.snippet.totalReplyCount || 0;
+        html += `
+          <div class="comment">
+            <div class="comment-author">${esc(tlc.authorDisplayName)}</div>
+            <div class="comment-text">${esc(tlc.textOriginal)}</div>
+            <div class="comment-meta">
+              ${tlc.publishedAt?.split('T')[0] || ''} ・ 高評価 ${fmtNum(tlc.likeCount)} ・ 返信 ${replyCount}件
+            </div>
+        `;
+
+        // Replies
+        const replies = t.replies?.comments || [];
+        for (const r of replies) {
+          const rs = r.snippet;
+          html += `
+            <div class="reply comment">
+              <div class="comment-author">${esc(rs.authorDisplayName)}</div>
+              <div class="comment-text">${esc(rs.textOriginal)}</div>
+              <div class="comment-meta">${rs.publishedAt?.split('T')[0] || ''} ・ 高評価 ${fmtNum(rs.likeCount)}</div>
+            </div>
+          `;
+        }
+        if (replyCount > replies.length) {
+          html += `<div class="reply" style="font-size:0.8em; color:#3ea6ff">... 他 ${replyCount - replies.length}件の返信</div>`;
+        }
+        html += '</div>';
+      }
+      html += `
+        <details style="margin-top:12px"><summary style="cursor:pointer; color:#3ea6ff; font-size:0.8em">Comments JSON</summary>
+          <pre style="font-size:0.75em; overflow:auto; max-height:400px; margin-top:8px; color:#aaa">${esc(JSON.stringify(threads, null, 2))}</pre>
+        </details>
+      </div>`;
+
+      content.innerHTML = html;
+    }
+
+    // ---------- Tab management ----------
+
+    function showTabs() {
+      document.getElementById('tabs').classList.remove('hidden');
+    }
+
+    function switchTab(name) {
+      document.querySelectorAll('.tab').forEach(t => {
+        t.classList.toggle('active', t.dataset.tab === name);
+      });
+      if (name === 'channel') renderChannel();
+      else if (name === 'videos') renderVideos();
+      // comments are rendered via fetchVideoAndComments
+    }
+
+    // ---------- UI helpers ----------
+
+    function showLoading(msg) {
+      document.getElementById('content').innerHTML = `<div class="loading">${esc(msg)}</div>`;
+    }
+
+    function showError(msg) {
+      document.getElementById('content').innerHTML = `<div class="card error">${esc(msg)}</div>`;
+    }
+
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function fmtNum(n) {
+      if (n == null) return '-';
+      const num = typeof n === 'string' ? parseInt(n, 10) : n;
+      if (isNaN(num)) return String(n);
+      return num.toLocaleString();
+    }
+  </script>
+</body>
+</html>
