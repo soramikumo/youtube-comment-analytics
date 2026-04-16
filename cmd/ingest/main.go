@@ -2,7 +2,35 @@
 // It collects channels, videos, and comments from the YouTube API
 // and writes them to TiDB.
 //
-// Usage:
+// # 処理フロー
+//
+//	channels.json に登録されたチャンネルを順に処理する。
+//
+//	チャンネルごとに以下の順で YouTube Data API v3 を呼び出す:
+//	  1. channels.list        — チャンネル情報取得          (1クォータ)
+//	  2. playlistItems.list   — アップロード動画ID一覧取得   (1クォータ/ページ)
+//	  3. videos.list          — 動画詳細取得 (50件バッチ)    (1クォータ/バッチ)
+//	  4. commentThreads.list  — トップレベルコメント取得     (1クォータ/ページ)
+//	                            返信は各スレッドに最大5件インラインで含まれる
+//
+// # フラグの役割
+//
+//	-max-videos  : 1チャンネルあたりの収集動画数上限。収集量を設計するためのパラメータ。
+//	-max-comments: 1動画あたりのトップレベルコメント収集数上限。
+//	-quota-limit : クォータ消費量がこの値に達したら処理を打ち切る安全弁。
+//	               -max-videos/-max-comments で収集量を制御し、
+//	               -quota-limit はバグや想定外データによるクォータ枯渇を防ぐ保険として機能する。
+//	-dry-run     : API は叩くが DB 書き込みをスキップする。動作確認・デバッグ用。
+//
+// # クォータ消費の目安 (デフォルト設定: 10動画, 100コメント/動画)
+//
+//	channels.list       :  1
+//	playlistItems.list  :  1  (10件なら1ページ)
+//	videos.list         :  1  (10件なら1バッチ)
+//	commentThreads.list : 10  (10動画 × 1ページ)
+//	合計                : 約13クォータ  (YouTube API 1日上限: 10,000)
+//
+// # Usage
 //
 //	go run ./cmd/ingest                          # collect all channels
 //	go run ./cmd/ingest -max-videos 5            # limit videos per channel
