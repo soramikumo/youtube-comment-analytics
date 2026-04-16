@@ -74,7 +74,8 @@ func main() {
 		log.Printf("📺 Processing channel: %s (%s)", ch.ID, ch.Note)
 
 		// 1. Fetch channel info
-		chResp, err := client.GetChannel(ctx, ch.ID)
+		resolvedID := resolveChannelInput(ch.ID)
+		chResp, err := client.GetChannel(ctx, resolvedID)
 		quota++
 		if err != nil {
 			log.Printf("  ❌ channels.list: %v", err)
@@ -182,6 +183,45 @@ func main() {
 	if lastErr != nil {
 		log.Printf("⚠️  Last error: %v", lastErr)
 	}
+}
+
+// resolveChannelInput normalizes a channel input to an ID or handle: prefix.
+// Supported formats:
+//   - Channel ID: UCX6OQ3DkcsbYNE6H8uQQuVA
+//   - Handle: @MrBeast
+//   - URL: https://www.youtube.com/@MrBeast
+//   - URL: https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA
+func resolveChannelInput(input string) string {
+	input = strings.TrimSpace(input)
+
+	// URL format
+	if strings.Contains(input, "youtube.com/") {
+		// https://www.youtube.com/@handle
+		if i := strings.Index(input, "/@"); i >= 0 {
+			handle := strings.TrimRight(input[i+2:], "/")
+			// Strip query parameters
+			if q := strings.IndexByte(handle, '?'); q >= 0 {
+				handle = handle[:q]
+			}
+			return "handle:@" + handle
+		}
+		// https://www.youtube.com/channel/UCxxxx
+		if i := strings.Index(input, "/channel/"); i >= 0 {
+			id := strings.TrimRight(input[i+9:], "/")
+			if q := strings.IndexByte(id, '?'); q >= 0 {
+				id = id[:q]
+			}
+			return id
+		}
+	}
+
+	// @handle format
+	if strings.HasPrefix(input, "@") {
+		return "handle:" + input
+	}
+
+	// Already a channel ID
+	return input
 }
 
 // ---------- Fetch helpers ----------
