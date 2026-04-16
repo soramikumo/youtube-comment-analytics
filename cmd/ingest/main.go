@@ -61,6 +61,7 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "fetch from API but skip DB writes")
 	flag.Parse()
 
+	// .env.local から API キーと DB 接続情報を、channels.json から対象チャンネル一覧を読み込む
 	cfg, err := config.Load(".env.local", "channels.json")
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -69,6 +70,7 @@ func main() {
 	client := youtube.NewClient(cfg.YouTubeAPIKey)
 	ctx := context.Background()
 
+	// dry-run 時は DB 接続をスキップし、store は nil のまま各 Upsert 呼び出しを無視する
 	var store *db.Store
 	if !*dryRun {
 		store, err = db.New(cfg.DBDSN)
@@ -78,7 +80,7 @@ func main() {
 		defer store.Close()
 	}
 
-	// Start ingest run tracking
+	// ingest_runs テーブルに実行ログを記録する（開始時刻・終了時刻・件数・クォータ消費量）
 	var run *db.IngestRun
 	if store != nil {
 		run, err = store.StartIngestRun()
@@ -94,6 +96,7 @@ func main() {
 	var lastErr error
 
 	for _, ch := range cfg.Channels {
+		// クォータ上限に達したらチャンネルループを打ち切る
 		if quota >= *quotaLimit {
 			log.Printf("⚠️  Quota limit reached (%d/%d), stopping", quota, *quotaLimit)
 			break
@@ -101,8 +104,11 @@ func main() {
 
 		log.Printf("📺 Processing channel: %s (%s)", ch.ID, ch.Note)
 
-		// 1. Fetch channel info
+		// channels.json の id にはチャンネルID・@ハンドル・URL のいずれも指定可能。
+		// resolveChannelInput で API クライアントが受け付ける形式に正規化する。
 		resolvedID := resolveChannelInput(ch.ID)
+
+		// 1. channels.list: チャンネルの基本情報と uploads プレイリスト ID を取得する
 		chResp, err := client.GetChannel(ctx, resolvedID)
 		quota++
 		if err != nil {
@@ -117,6 +123,7 @@ func main() {
 			continue
 		}
 
+		// channels テーブルに UPSERT（同一 ID なら上書き更新）
 		if store != nil {
 			if err := store.UpsertChannel(chRow); err != nil {
 				log.Printf("  ❌ upsert channel: %v", err)
@@ -127,7 +134,8 @@ func main() {
 		totalChannels++
 		log.Printf("  ✅ Channel: %s (%s subscribers)", chRow.Title, fmtInt(chRow.SubscriberCount))
 
-		// 2. Fetch video list
+		// 2. playlistItems.list: uploads プレイリストから動画 ID 一覧を取得する。
+		// チャンネルの全動画はこのプレイリストに格納されている（YouTube の仕様）。
 		uploadsID := chRow.UploadsPlaylistID
 		if uploadsID == "" {
 			log.Printf("  ⚠️  No uploads playlist, skipping videos")
@@ -138,7 +146,8 @@ func main() {
 		quota += q
 		log.Printf("  📋 Found %d videos (quota: +%d)", len(videoIDs), q)
 
-		// 3. Fetch video details (batch of 50)
+		// 3. videos.list: 動画 ID を最大 50 件ずつバッチで詳細取得する。
+		// 統計情報（再生数・コメント数）や再生時間などを取得するために別途呼び出しが必要。
 		for i := 0; i < len(videoIDs); i += 50 {
 			end := i + 50
 			if end > len(videoIDs) {
@@ -156,6 +165,7 @@ func main() {
 
 			videos := parseVideos(vidResp)
 			for _, v := range videos {
+				// videos テーブルに UPSERT
 				if store != nil {
 					if err := store.UpsertVideo(v); err != nil {
 						log.Printf("  ❌ upsert video %s: %v", v.ID, err)
@@ -165,6 +175,7 @@ func main() {
 				}
 				totalVideos++
 
+				// コメントが無効化されている動画はスキップ
 				if v.CommentsDisabled {
 					log.Printf("  🚫 %s: comments disabled", v.Title)
 					continue
@@ -174,7 +185,7 @@ func main() {
 					break
 				}
 
-				// 4. Fetch comments
+				// 4. commentThreads.list: トップレベルコメントと返信を取得して DB に保存する
 				nc, q := fetchComments(ctx, client, store, v.ID, *maxComments, *dryRun)
 				quota += q
 				totalComments += nc
@@ -183,7 +194,7 @@ func main() {
 		}
 	}
 
-	// Finish ingest run
+	// ingest_runs テーブルの実行ログに集計結果と成否を書き込む
 	if run != nil {
 		run.ChannelsCount = totalChannels
 		run.VideosCount = totalVideos
@@ -222,12 +233,12 @@ func main() {
 func resolveChannelInput(input string) string {
 	input = strings.TrimSpace(input)
 
-	// URL format
+	// URL 形式: youtube.com/@ または youtube.com/channel/ を含む場合に分岐
 	if strings.Contains(input, "youtube.com/") {
 		// https://www.youtube.com/@handle
 		if i := strings.Index(input, "/@"); i >= 0 {
 			handle := strings.TrimRight(input[i+2:], "/")
-			// Strip query parameters
+			// クエリパラメータを除去
 			if q := strings.IndexByte(handle, '?'); q >= 0 {
 				handle = handle[:q]
 			}
@@ -243,17 +254,19 @@ func resolveChannelInput(input string) string {
 		}
 	}
 
-	// @handle format
+	// @ハンドル形式: GetChannel が受け付ける "handle:@xxx" プレフィックスに変換
 	if strings.HasPrefix(input, "@") {
 		return "handle:" + input
 	}
 
-	// Already a channel ID
+	// それ以外はチャンネル ID としてそのまま渡す
 	return input
 }
 
 // ---------- Fetch helpers ----------
 
+// fetchVideoIDs は uploads プレイリストから動画 ID を最大 max 件取得する。
+// playlistItems.list はページネーションで最大 50 件/ページのため、必要に応じてページをまたぐ。
 func fetchVideoIDs(ctx context.Context, client *youtube.Client, playlistID string, max int) ([]string, int) {
 	var ids []string
 	quota := 0
@@ -282,6 +295,7 @@ func fetchVideoIDs(ctx context.Context, client *youtube.Client, playlistID strin
 			}
 		}
 
+		// nextPageToken が空なら最終ページ
 		next := getString(resp, "nextPageToken")
 		if next == "" || len(ids) >= max {
 			break
@@ -291,6 +305,9 @@ func fetchVideoIDs(ctx context.Context, client *youtube.Client, playlistID strin
 	return ids, quota
 }
 
+// fetchComments は指定動画のトップレベルコメントと返信を取得して DB に保存する。
+// commentThreads.list のレスポンスにはトップレベルコメントごとに最大5件の返信がインラインで含まれる。
+// コメント・返信それぞれの投稿者を authors テーブルにも UPSERT する（著者テーブルの正規化）。
 func fetchComments(ctx context.Context, client *youtube.Client, store *db.Store, videoID string, maxComments int, dryRun bool) (int, int) {
 	total := 0
 	quota := 0
@@ -306,7 +323,7 @@ func fetchComments(ctx context.Context, client *youtube.Client, store *db.Store,
 		resp, err := client.GetCommentThreads(ctx, videoID, perPage, pageToken)
 		quota++
 		if err != nil {
-			// Comments might be disabled
+			// コメント無効化の場合は正常扱いで終了
 			if strings.Contains(err.Error(), "commentsDisabled") || strings.Contains(err.Error(), "disabled") {
 				return 0, quota
 			}
@@ -317,10 +334,10 @@ func fetchComments(ctx context.Context, client *youtube.Client, store *db.Store,
 		items := getItems(resp)
 		for _, thread := range items {
 			snippet := getMap(thread, "snippet")
-			tlc := getMap(snippet, "topLevelComment")
+			tlc := getMap(snippet, "topLevelComment") // トップレベルコメントオブジェクト
 			tlcSnippet := getMap(tlc, "snippet")
 
-			// Upsert author
+			// トップレベルコメントの投稿者を authors テーブルに UPSERT
 			authorID := extractAuthorID(tlcSnippet)
 			if authorID != "" && !dryRun && store != nil {
 				store.UpsertAuthor(&db.AuthorRow{
@@ -330,7 +347,7 @@ func fetchComments(ctx context.Context, client *youtube.Client, store *db.Store,
 				})
 			}
 
-			// Upsert comment
+			// トップレベルコメントを comments テーブルに UPSERT
 			commentRow := &db.CommentRow{
 				ID:                      getString(tlc, "id"),
 				VideoID:                 videoID,
@@ -347,7 +364,8 @@ func fetchComments(ctx context.Context, client *youtube.Client, store *db.Store,
 			}
 			total++
 
-			// Process inline replies (up to 5)
+			// インライン返信を replies テーブルに UPSERT
+			// API は最大5件の返信をインラインで返す。5件超は別途 comments.list で取得が必要だが現時点では未対応。
 			replies := getMap(thread, "replies")
 			if replies != nil {
 				replyComments, _ := replies["comments"].([]any)
@@ -383,6 +401,7 @@ func fetchComments(ctx context.Context, client *youtube.Client, store *db.Store,
 			}
 		}
 
+		// nextPageToken が空なら最終ページ
 		next := getString(resp, "nextPageToken")
 		if next == "" || total >= maxComments {
 			break
@@ -394,6 +413,7 @@ func fetchComments(ctx context.Context, client *youtube.Client, store *db.Store,
 
 // ---------- Parse helpers ----------
 
+// parseChannel は channels.list のレスポンスから ChannelRow を生成する。
 func parseChannel(resp map[string]any) *db.ChannelRow {
 	items := getItems(resp)
 	if len(items) == 0 {
@@ -412,7 +432,7 @@ func parseChannel(resp map[string]any) *db.ChannelRow {
 		CustomURL:          getString(snippet, "customUrl"),
 		Country:            getString(snippet, "country"),
 		ThumbnailURL:       getString(getMap(getMap(snippet, "thumbnails"), "high"), "url"),
-		UploadsPlaylistID:  getString(rp, "uploads"),
+		UploadsPlaylistID:  getString(rp, "uploads"), // 動画一覧取得に使うプレイリスト ID
 		SubscriberCount:    getInt64(stats, "subscriberCount"),
 		VideoCount:         getInt(stats, "videoCount"),
 		ViewCount:          getInt64(stats, "viewCount"),
@@ -420,6 +440,7 @@ func parseChannel(resp map[string]any) *db.ChannelRow {
 	}
 }
 
+// parseVideos は videos.list のレスポンスから VideoRow のスライスを生成する。
 func parseVideos(resp map[string]any) []*db.VideoRow {
 	items := getItems(resp)
 	var result []*db.VideoRow
@@ -428,6 +449,7 @@ func parseVideos(resp map[string]any) []*db.VideoRow {
 		stats := getMap(item, "statistics")
 		cd := getMap(item, "contentDetails")
 
+		// tags は可変長配列のため JSON 文字列として保存する
 		tagsJSON := "null"
 		if tags, ok := snippet["tags"]; ok {
 			if b, err := jsonMarshal(tags); err == nil {
@@ -443,7 +465,7 @@ func parseVideos(resp map[string]any) []*db.VideoRow {
 			ThumbnailURL:     getString(getMap(getMap(snippet, "thumbnails"), "high"), "url"),
 			CategoryID:       getInt(snippet, "categoryId"),
 			DefaultLanguage:  getString(snippet, "defaultLanguage"),
-			DurationSeconds:  parseDuration(getString(cd, "duration")),
+			DurationSeconds:  parseDuration(getString(cd, "duration")), // ISO 8601 → 秒数に変換
 			Tags:             tagsJSON,
 			ViewCount:        getInt64(stats, "viewCount"),
 			LikeCount:        getInt64(stats, "likeCount"),
@@ -451,7 +473,7 @@ func parseVideos(resp map[string]any) []*db.VideoRow {
 			VideoPublishedAt: parseTime(getString(snippet, "publishedAt")),
 		}
 
-		// Check if live archive
+		// liveStreamingDetails が存在する場合はライブアーカイブとして扱う
 		lsd := getMap(item, "liveStreamingDetails")
 		if lsd != nil {
 			v.IsLiveArchive = true
@@ -468,6 +490,8 @@ func parseVideos(resp map[string]any) []*db.VideoRow {
 	return result
 }
 
+// extractAuthorID はコメント snippet の authorChannelId.value を取り出す。
+// YouTube API はチャンネル ID を {"value": "UCxxx"} という入れ子構造で返す。
 func extractAuthorID(snippet map[string]any) string {
 	aci := getMap(snippet, "authorChannelId")
 	if aci == nil {
@@ -478,6 +502,7 @@ func extractAuthorID(snippet map[string]any) string {
 
 // ---------- Generic helpers ----------
 
+// getItems は YouTube API レスポンスの "items" 配列を []map[string]any に変換する。
 func getItems(resp map[string]any) []map[string]any {
 	items, _ := resp["items"].([]any)
 	result := make([]map[string]any, 0, len(items))
@@ -505,6 +530,7 @@ func getString(m map[string]any, key string) string {
 	return v
 }
 
+// getInt は YouTube API が数値を float64 または string で返す両パターンに対応する。
 func getInt(m map[string]any, key string) int {
 	if m == nil {
 		return 0
@@ -549,7 +575,7 @@ func parseTimePtr(s string) *time.Time {
 	return &t
 }
 
-// parseDuration converts ISO 8601 duration (PT3M21S) to seconds.
+// parseDuration は ISO 8601 形式の動画時間（例: PT3M21S）を秒数に変換する。
 func parseDuration(iso string) int {
 	if !strings.HasPrefix(iso, "PT") {
 		return 0
@@ -557,19 +583,16 @@ func parseDuration(iso string) int {
 	iso = strings.TrimPrefix(iso, "PT")
 	total := 0
 
-	// Hours
 	if i := strings.Index(iso, "H"); i >= 0 {
 		n, _ := strconv.Atoi(iso[:i])
 		total += n * 3600
 		iso = iso[i+1:]
 	}
-	// Minutes
 	if i := strings.Index(iso, "M"); i >= 0 {
 		n, _ := strconv.Atoi(iso[:i])
 		total += n * 60
 		iso = iso[i+1:]
 	}
-	// Seconds
 	if i := strings.Index(iso, "S"); i >= 0 {
 		n, _ := strconv.Atoi(iso[:i])
 		total += n
