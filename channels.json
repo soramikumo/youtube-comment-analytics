@@ -1,0 +1,14 @@
+{
+  "channels": [
+    {
+      "id": "UCX6OQ3DkcsbYNE6H8uQQuVA",
+      "note": "MrBeast (テスト用 / チャンネルID指定)"
+    }
+  ],
+  "_supported_id_formats": [
+    "UCX6OQ3DkcsbYNE6H8uQQuVA          (チャンネルID)",
+    "@MrBeast                            (@ハンドル)",
+    "https://www.youtube.com/@MrBeast    (URL/@ハンドル)",
+    "https://www.youtube.com/channel/UC… (URL/チャンネルID)"
+  ]
+}
